@@ -12,9 +12,11 @@ import os
 os.environ['CUPY_ACCELERATORS'] = 'cub_python'
 
 class Halo:
-    def __init__(self):
-        halo = np.load('box_3_z_1_halotree.npy',allow_pickle=True).tolist()
-        ds = yt.load('box_3_z_1-final/DD0679/output_0679')
+    def __init__(self, timestep, testing=True):
+        halo = np.load('halotree_2020_final.npy',allow_pickle=True).tolist()
+        ds_path_1 = 'pfs_allsnaps_%s.txt' % halo_version
+        file_list = np.loadtxt(ds_path_1,dtype=str)[:,0]
+        ds = yt.load(file_list[timestep])
         plotd = np.load('plothype0_52.npy',allow_pickle=True).tolist()
         rad = halo['0'][5]['Halo_Radius']
         center = halo['0'][5]['Halo_Center']
@@ -34,24 +36,25 @@ class Halo:
         self.vel = v.v
         self.dds = reg['dx'].in_units('cm').v
         self.ur = self.ll + self.dds[:, np.newaxis]
-        stars = np.load('starlists_1408.npy',allow_pickle=True).tolist()
-        print(stars['0'][0])
-        self.star_pos = stars['0'][0]['positions2'] * ds.length_unit.in_units("cm").v
-        self.svels = stars['0'][0]['vels2']
+        stars = np.load('starlists_2020.npy',allow_pickle=True).tolist()
+        print(stars['0'][0].keys())
+        self.spos = stars['0'][timestep]['positions2'] * ds.length_unit.in_units("cm").v
+        self.svels = stars['0'][timestep]['vels2']
         self.chivmet_0 = plotd['chivmet']
         self.chismet_0 = plotd['chismet']
         self.chivhe = plotd['chivhe']
         self.chishe = plotd['chishe']
         self.nu = plotd['nu']
-        self.temps = reg['temperature'].in_units('K')
-        
-        self.i_temp = np.minimum(np.searchsorted(plotd['temp'],self.temps,side='right'),len(plotd['temp'])-1)
-        self.metals = reg['metallicity'].in_units('Zsun').V
-        self.ray_end = np.array([(star +( (np.random.rand(1, ) -0.5) *radius.v)) for star in self.star_pos])
+        self.temps = reg['temperature'].in_units('K').v
+        self.i_temp = np.minimum(np.searchsorted(plotd['temp'],self.temps),len(plotd['temp'])-1)
+        self.metals = reg['metallicity'].in_units('Zsun').v
         self.ll_box = center-radius.v
         self.ur_box = center+radius.v
         self.den = np.array((reg['HI_Density']+reg['H2I_Density']+reg['H2II_Density']).in_units('g/cm**3').v)
-        self.load_dust()
+        if(not testing):
+            self.load_dust()
+        else:
+            self.load_mock_dust()
         
     def redshift(self,initial_pos,final_pos,ray_ind,star_vel):
         ind_0 = ray_ind[:,0]
@@ -79,15 +82,18 @@ class Halo:
         self.chisdust_0 = chisdust[np.newaxis,:]*(self.temp<self.Tmax)[:,np.newaxis]
         self.chivdust_0 = chivdust[np.newaxis,:]*(self.temp<self.Tmax)[:,np.newaxis]
         #self.P1, self.P2, self.P3, self.P4 = self.get_scattering(d,nu_d)
-    
-    def ray_trace_1(self, cell_based=True):
-        initial_pos = self.star_pos
-        final_pos = self.ray_end
+        
+    def load_mock_dust(self):
+        chivdust, chisdust = np.zeros_like(self.nu), np.zeros_like(self.nu)
+        self.chisdust_0 = chisdust[np.newaxis, :]
+        self.chivdust_0 = chivdust[np.newaxis, :]
+        
+
+    def ray_trace_1(self, initial_pos, final_pos, cell_based=True):
         ll = self.ll
         ur = self.ur
-
-        M = final_pos[:,np.newaxis]-initial_pos
         split_ll = np.array_split(np.arange(len(self.ll)),np.maximum(len(ll)/200,1))
+        M = final_pos[:,np.newaxis]-initial_pos
         ray_ind = np.array([])
         tmin_f = np.array([])
         tmax_f = np.array([])
@@ -121,15 +127,11 @@ class Halo:
         p_close = tmin_f[:,np.newaxis]*M[ray_ind[:,0],ray_ind[:,2]]+initial_pos[ray_ind[:,2]]
         p_far = tmax_f[:,np.newaxis]*M[ray_ind[:,0],ray_ind[:,2]]+initial_pos[ray_ind[:,2]]
         dr = np.linalg.norm(p_far-p_close, axis=1)
-        print(dr.shape)
         return dr,ray_ind
     
-    def par_ray_trace_1(self):
-        initial_pos = self.star_pos
-        final_pos = self.ray_end
+    def par_ray_trace_1(self, initial_pos, final_pos):
         ll = self.ll
         ur = self.ur
-
         ll_g = cp.asarray(ll, dtype=cp.float64)
         ur_g = cp.asarray(ur, dtype=cp.float64)
         ipos_g = cp.asarray(initial_pos, dtype=cp.float64)
@@ -173,12 +175,9 @@ class Halo:
         p_close = cp.expand_dims(tmin_f_clamped, axis=1)*M[ray_ind[:,0],ray_ind[:,2]]+ipos_g[ray_ind[:,2]]
         p_far = cp.expand_dims(tmax_f, axis=1)*M[ray_ind[:,0],ray_ind[:,2]]+ipos_g[ray_ind[:,2]]
         dr = cp.linalg.norm(p_far-p_close, axis=1)
-        print(dr.shape)
         return dr.get(), ray_ind.get()
 
-    def ray_trace_4(self, ray_ind, dr):
-        final_pos = self.ray_end
-        initial_pos = self.star_pos
+    def ray_trace_4(self, ray_ind, dr, initial_pos, final_pos):
         tau_i_j = np.zeros((len(final_pos),len(initial_pos),len(self.nu)))
         red = self.redshift(initial_pos,final_pos,ray_ind,self.svels)
         ind_all = np.unique(ray_ind[:,1])
@@ -193,8 +192,10 @@ class Halo:
             inds_list = np.arange(len(inds))
             Z = self.metals[inds][:,np.newaxis]
             DGRm = mH*10**(2.445*np.log10(Z)-2.029)
-            chix = self.chisdust_0[temp_j]*DGRm + self.chishe[temp_j] + Z*self.chismet_0[temp_j] +\
-                                        self.chivdust_0[temp_j]*DGRm + self.chivhe[temp_j] + Z*self.chivmet_0[temp_j]
+            #chix = self.chisdust_0[temp_j]*DGRm + self.chishe[temp_j] + Z*self.chismet_0[temp_j] +\
+            #                            self.chivdust_0[temp_j]*DGRm + self.chivhe[temp_j] + Z*self.chivmet_0[temp_j]
+            chix =  self.chishe[temp_j] + Z*self.chismet_0[temp_j] +\
+                                       self.chivhe[temp_j] + Z*self.chivmet_0[temp_j]
             #chix * den[cell] / mH = optical depth
             chix *= self.den[inds,np.newaxis]/mH
             chix = {t: chix[i] for i,t in enumerate(inds)}
@@ -215,40 +216,33 @@ class Halo:
         return tau_i_j,bigcount
     
 
-    def par_ray_trace_4(self, ray_ind, dr):
-        final_pos = self.ray_end
-        initial_pos = self.star_pos
-
-        nu_stream = cp.cuda.Stream(non_blocking=True)
-        nu_gpu = cp.empty_like(self.nu)
-        nu_gpu.set(self.nu, stream=nu_stream)
-        tau_ij_cpu = cupyx.zeros_pinned((len(final_pos),len(initial_pos),len(self.nu)))
-        tau_ij_gpu = cp.asarray(tau_ij_cpu)
+    def par_ray_trace_4(self, ray_ind, dr, initial_pos, final_pos):
+        nu_gpu = cp.asarray(self.nu)
+        tau_ij_gpu = cp.zeros((len(final_pos),len(initial_pos),len(self.nu)))
         ray_ind_gpu = cp.asarray(ray_ind)
         dr_gpu = cp.asarray(dr)
         red = self.redshift(initial_pos,final_pos,ray_ind,self.svels)
+        red_gpu = cp.asarray(red)
         ind_all = np.unique(ray_ind[:,1])
         split_inds = np.array_split(ind_all,max(len(ind_all)/100,1))
-        bigcount = 0
-        nu_stream.synchronize()
-        diff_nu = cp.min(cp.abs(cp.diff(self.nu)/self.nu[1:]))
-        bool_red = cp.abs(red-1) > 0.5*diff_nu
+        diff_nu = cp.min(cp.abs(cp.diff(nu_gpu)/nu_gpu[1:]))
+        bool_red = cp.abs(red_gpu-1) > 0.5*diff_nu
+        chishe_gpu_all = cp.asarray(self.chishe)
+        chismet_gpu_all = cp.asarray(self.chismet_0)
+        chivhe_gpu_all = cp.asarray(self.chivhe)
+        chivmet_gpu_all = cp.asarray(self.chivmet_0)
+
         for ind_i, inds in enumerate(split_inds):
-            count = 0
             temp_j = self.i_temp[inds]
-            chisdust_gpu = cp.asarray(self.chisdust_0[temp_j])
-            chishe_gpu = cp.asarray(self.chishe[temp_j])
-            chismet_gpu = cp.asarray(self.chismet_0[temp_j])
-            chivdust_gpu = cp.asarray(self.chivdust_0[temp_j])
-            chivhe_gpu = cp.asarray(self.chivhe[temp_j])
-            chivmet_gpu = cp.asarray(self.chivmet_0[temp_j])
 
             Z = self.metals[inds][:,np.newaxis]
             z_gpu = cp.asarray(Z)
             # GPU - accelerated
             DGRm = mH*10**(2.445*cp.log10(z_gpu)-2.029) #elementwise kernel here?
-            chix = chisdust_gpu*DGRm + chishe_gpu + Z*chismet_gpu +\
-                                        chivdust_gpu*DGRm + chivhe_gpu + Z*chivmet_gpu
+            # chix = chisdust_gpu*DGRm + chishe_gpu + Z*chismet_gpu +\
+            #                             chivdust_gpu*DGRm + chivhe_gpu + Z*chivmet_gpu
+            chix = chishe_gpu_all[temp_j] + z_gpu*chismet_gpu_all[temp_j] +\
+                                         chivhe_gpu_all[temp_j] + z_gpu*chivmet_gpu_all[temp_j]
             
             den_i_gpu = cp.asarray(self.den[inds,np.newaxis])
             chix *= (den_i_gpu/mH)
@@ -257,20 +251,19 @@ class Halo:
             inds_gpu = cp.asarray(inds)
             bool_in = cp.isin(ray_ind_gpu[:,1],inds_gpu)
             ray_ind_i = cp.arange(len(ray_ind_gpu))[bool_in]
-            ind_s = ray_ind[bool_in]
+            ind_s = ray_ind_gpu[bool_in]
             #i_s, t_s, j_s = ray_ind[bool_in][:,0],ray_ind[bool_in][:,1],ray_ind[bool_in][:,2]
             drt = dr_gpu[bool_in]
-            for y in range(ind_s.shape[1]):
+            bool_red_i = bool_red[ray_ind_i]
+            len_y = cp.arange(ind_s.shape[0])
+            for y in len_y[bool_red_i]:
                 if bool_red[ray_ind_i[y]]:
-                    chix_t = cp.interp(nu_gpu,nu_gpu*red[ray_ind_i[y]],chix[y, 1])
-                    tau_ij_gpu[y, 0][y, 2] += drt[y]*chix_t
+                    chix_t = cp.interp(nu_gpu,nu_gpu*red_gpu[ray_ind_i[y]],chix[ind_s[y, 1]])
+                    tau_ij_gpu[ind_s[y, 0]][ind_s[y, 2]] += drt[y]*chix_t
                 else:
-                    tau_ij_gpu[y, 0][y, 2] += drt[y]*chix[y, 1]
-            count += bool_in.sum()
-            bigcount += count
-        chix = {}
-        tau_ij_gpu = np.exp(-tau_ij_gpu)
-        return tau_ij_gpu,bigcount
+                    tau_ij_gpu[ind_s[y, 0]][ind_s[y, 2]] += drt[y]*chix[ind_s[y, 1]]
+        tau_ij_gpu = cp.exp(-tau_ij_gpu)
+        return tau_ij_gpu.get()
 
 
 
@@ -282,7 +275,34 @@ if __name__ == "__main__":
     c_cgs =  2.99792458e10
     MIN_DENSITY = 1e-27
     PROTON_MASS = 1.67262192e-24
-    h_0 = Halo()
+    halo_version = 2020 #updated from local file
+    h_0 = Halo(0)
 
-    h_0.par_ray_trace_1()
+    job_split = np.array_split(np.arange(len(h_0.spos)),np.maximum(len(h_0.spos)/50,1))
+    i_stars = job_split[0]
+    ipos_test = h_0.spos[i_stars]
+    fpos_test = ((h_0.ll+h_0.ur)/2)[i_stars]
+
+    # print('Running CPU-Side Test: Ray Trace 1')
+    # s_t  = time.time()
+    # dr_cpu, ray_ind_cpu = h_0.ray_trace_1(initial_pos=ipos_test, final_pos=fpos_test)
+    # print('CPU run complete. Took {}s'.format(time.time() - s_t))
+
+    print('Running GPU-Side Test: Ray Trace 1')
+    s_t  = time.time()
+    dr_gpu, ray_ind_gpu = h_0.par_ray_trace_1(initial_pos=ipos_test, final_pos=fpos_test)
+    print('GPU run complete. Took {}s'.format(time.time() - s_t))
+
+    # # print(dr_cpu, dr_gpu)
+    # # print(ray_ind_cpu, ray_ind_gpu)
+
+    # print('Running CPU-Side Test: Ray Trace 4')
+    # s_t  = time.time()
+    # dr_cpu, ray_ind_cpu = h_0.ray_trace_4(ray_ind=ray_ind_cpu, dr=dr_cpu, initial_pos=ipos_test, final_pos=fpos_test)
+    # print('CPU run complete. Took {}s'.format(time.time() - s_t))
+
+    print('Running GPU-Side Test: Ray Trace 4')
+    s_t  = time.time()
+    tau_gpu = h_0.par_ray_trace_4(ray_ind=ray_ind_gpu, dr=dr_gpu, initial_pos=ipos_test, final_pos=fpos_test)
+    print('GPU run complete. Took {}s'.format(time.time() - s_t))
 

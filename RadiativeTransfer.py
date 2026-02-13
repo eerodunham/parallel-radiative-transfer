@@ -1348,7 +1348,7 @@ class Radiative_Transfer():
                         (self.halo_c+self.halo_r)/lu)
         densities = (reg['HI_Density']+reg['HII_Density']+2*reg['H2I_Density']+2*reg['H2II_Density']).in_units('g/cm**3')
         dx = reg['dx'].in_units('cm')
-        temps = reg['temperature'].in_units('K')
+        
         metals = reg['metallicity'].in_units('Zsun')
         #print(metals)
         #print(self.vel_halo)
