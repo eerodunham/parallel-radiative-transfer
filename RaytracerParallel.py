@@ -8,6 +8,7 @@ import cupyx
 from cupyx.profiler import benchmark, profile
 from hyperion.dust import SphericalDust
 import os
+import matplotlib.pyplot as plt
 
 os.environ['CUPY_ACCELERATORS'] = 'cub_python'
 
@@ -55,6 +56,135 @@ class Halo:
             self.load_dust()
         else:
             self.load_mock_dust()
+
+        # self.diff_nu_kernel =  cp.ReductionKernel(
+        #     'T gnu_slice, raw T gnu',      
+        #     'T out',          
+        #     'abs((gnu[i+1] - gnu[i]) / gnu[i+1])', #Map function: get normalized diff
+        #     'min(a, b)',      #Reduction function: take minimum, recursively reduce
+        #     'out = a',        #Post-map: identity
+        #     '1.0e20',         
+        #     'diff_nu_kernel' 
+        # )
+        self.bool_red_kernel = cp.ElementwiseKernel(
+            'T gredshift, T diff_nu',  
+            'bool bool_red_out',        
+            '''
+            bool_red_out = (abs(gredshift - 1) > 0.5 * diff_nu);
+            ''', 
+            'bool_red_kernel'        
+        )
+        self.bool_tmin_kernel = cp.ElementwiseKernel(
+            'T tmax, T tmin',  
+            'bool bool_tmin',        
+            '''
+            bool_tmin = (tmin < tmax) & (tmin < 1) & (tmax > 0);
+            ''', 
+            'bool_tmin_kernel'    
+        )
+        self.chix_kernel = cp.ElementwiseKernel(
+            'T Z, T chishe, T chismet, T chivhe, T chivmet, T den',
+            'T chix',
+            '''
+            chix = (chishe + 0.0204*Z*chismet + chivhe + 0.0204*Z*chivmet) * den;
+            ''',
+            'chix_kernel'
+        )
+
+        self.batch_interp_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void batch_interp(const double* gnu,      // [n_nu]
+                        const double* redshift, // [n_rays]
+                        const double* chix,     // [n_unique_inds, n_nu]
+                        const int* chi_ind,     // [n_rays]
+                        const double* drt,      // [n_rays]
+                        const int* i_s,         // [n_rays]
+                        const int* j_s,         // [n_rays]
+                        int n_nu,
+                        int n_rays,
+                        int n_ipos,             // for indexing gtau
+                        double* gtau)           // [n_fpos, n_ipos, n_nu]
+        {
+            int ray_idx = blockIdx.x;
+            int nu_idx = threadIdx.x + blockIdx.y * blockDim.x;
+            double eps = 1e-5;
+            if (ray_idx < n_rays && nu_idx < n_nu) {
+                double val = 0;
+                int row_offset = chi_ind[ray_idx] * n_nu;
+                if(redshift[ray_idx] > 1.0f - eps && redshift[ray_idx] < 1.0f + eps) {
+                    val = chix[row_offset + nu_idx];
+                } else {
+                    double red_gnu = gnu[nu_idx] / redshift[ray_idx];
+                    int low = 0;
+                    int mid = 0;
+                    int high = n_nu - 1;
+                    while (high - low > 1) {
+                        mid = (low + high) >> 1;
+                        bool go_right = (gnu[mid] < red_gnu);
+                        low = go_right ? mid : low;
+                        high = go_right ? high : mid;
+                    }
+                    if (low < 0) val = chix[row_offset];
+                    else if (low >= n_nu) val = chix[row_offset + n_nu - 1];
+                    else {
+                        double x0 = gnu[low];
+                        double x1 = gnu[low+1];
+                        double y0 = chix[row_offset + low];
+                        double y1 = chix[row_offset + low+1];
+                        val = y0 + ((y1 - y0) / (x1 - x0)) * (red_gnu-x0);
+                    }
+                }
+
+                int out_idx = i_s[ray_idx] * (n_ipos * n_nu) + j_s[ray_idx] * n_nu + nu_idx;
+                atomicAdd(&gtau[out_idx], drt[ray_idx] * val);
+            }
+        }
+        ''', 'batch_interp')
+
+        self.interp_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void interp(const double* gnu,      // [n_nu]
+                    const double redshift, // [n_rays]
+                    const double* chix,
+                    int n_nu,
+                    double* interp) 
+        {
+            int nu_idx = threadIdx.x + blockIdx.x * blockDim.x;
+            double eps = 1e-5;
+            if(nu_idx < n_nu) {
+                double red_gnu = gnu[nu_idx] / redshift;
+                int low = 0;
+                int mid = 0;
+                int high = n_nu - 1;
+                while (high - low > 1) {
+                    mid = (low + high) >> 1;
+                    bool go_right = (gnu[mid] < red_gnu);
+                    low = go_right ? mid : low;
+                    high = go_right ? high : mid;
+                }
+                double x0 = gnu[low];
+                double x1 = gnu[low+1];                
+                double y0 = chix[low];
+                double y1 = chix[low+1];
+                double val = y0 + ((y1 - y0) / (x1 - x0)) * (red_gnu-x0);
+                interp[nu_idx] = val;
+            }
+        }
+        ''', 'interp')
+
+
+    def binSort(self, target):
+        lo = 0
+        hi = len(self.nu)-1
+        while(lo < hi):
+            mid = int(lo + (hi-lo) / 2)
+            print(lo, hi, mid)
+            if(self.nu[mid] > target):
+                hi = mid - 1
+            elif(self.nu[mid] < target):
+                lo = mid + 1
+        print(self.nu[lo], target, self.nu[lo-1])
+        return lo
         
     def redshift(self,initial_pos,final_pos,ray_ind,star_vel):
         ind_0 = ray_ind[:,0]
@@ -138,12 +268,12 @@ class Halo:
         fpos_g = cp.asarray(final_pos, dtype=cp.float64)
         M = (cp.expand_dims(fpos_g, axis=1) - ipos_g)
         ll_ind = cp.arange(ll_g.shape[0])
-        ll_max = np.maximum(ll_g.shape[0]//200, 1)
+        ll_max = max(ll_g.shape[0]//200, 1)
         split_ll_g = cp.array_split(ary=ll_ind, indices_or_sections=ll_max)
-        tmin_f = cp.array([], dtype=cp.float64)
-        tmax_f = cp.array([], dtype=cp.float64)
         ray_ind = cp.array([], dtype=cp.int16)
-        i = 0
+        ray_ind_list = []
+        tmin_list = []
+        tmax_list = []
         for split_ll_i in split_ll_g:
             t0 = (cp.expand_dims(ll_g[split_ll_i], axis=1) - ipos_g) / cp.expand_dims(M, axis=1) 
             t1 = (cp.expand_dims(ur_g[split_ll_i], axis=1) - ipos_g) / cp.expand_dims(M, axis=1) 
@@ -152,7 +282,7 @@ class Halo:
             del t0, t1
             tmin = cp.max(tmin, axis=3)
             tmax = cp.min(tmax, axis=3)
-            bool_tmin = (tmin < tmax)*(tmin < 1)*(tmax > 0) 
+            bool_tmin = self.bool_tmin_kernel(tmax, tmin)
             tmax_b = tmax[bool_tmin]
             del tmax
             tmin_b = tmin[bool_tmin]
@@ -161,110 +291,141 @@ class Halo:
             del bool_tmin
             ray_ind_g = cp.stack((target_ind, split_ll_i[cell_ind], star_ind), axis=1)
             del target_ind, cell_ind, star_ind
-            tmin_f = cp.append(tmin_f, tmin_b)
-            tmax_f = cp.append(tmax_f, tmax_b)
-            del tmin_b, tmax_b
-            if(i == 0):
-                ray_ind = ray_ind_g
-            else:
-                ray_ind = cp.vstack((ray_ind, ray_ind_g))
-            del ray_ind_g
-            i += 1
+            tmin_list.append(tmin_b)
+            tmax_list.append(tmax_b)
+            ray_ind_list.append(ray_ind_g)
+        ray_ind = cp.vstack(ray_ind_list)
+        tmin_f = cp.concatenate(tmin_list)
+        tmax_f = cp.concatenate(tmax_list)
         tmin_f_clamped = cp.maximum(tmin_f, 0)
         del tmin_f
-        p_close = cp.expand_dims(tmin_f_clamped, axis=1)*M[ray_ind[:,0],ray_ind[:,2]]+ipos_g[ray_ind[:,2]]
-        p_far = cp.expand_dims(tmax_f, axis=1)*M[ray_ind[:,0],ray_ind[:,2]]+ipos_g[ray_ind[:,2]]
+        ray_ind_col2 = ray_ind[:, 2]
+        ray_ind_col0 = ray_ind[:,0]
+        p_close = cp.expand_dims(tmin_f_clamped, axis=1)*M[ray_ind_col0,ray_ind_col2]+ipos_g[ray_ind_col2]
+        p_far = cp.expand_dims(tmax_f, axis=1)*M[ray_ind_col0,ray_ind_col2]+ipos_g[ray_ind_col2]
         dr = cp.linalg.norm(p_far-p_close, axis=1)
         return dr.get(), ray_ind.get()
+    
+    
+    def exp_prt_4(self, ray_ind, dr, ipos, fpos):
+        gtau_i_j = cp.zeros((len(fpos), len(ipos), len(self.nu)), dtype=cp.float64)
+        gredshift = cp.asarray(self.redshift(ipos, fpos, ray_ind, self.svels), dtype=cp.float64)
+        gnu = cp.asarray(self.nu, dtype=cp.float64)
+        gmetals = cp.asarray(self.metals, dtype=cp.float64)
+        gi_temp = cp.asarray(self.i_temp)
+        gray_ind_col_1 = cp.asarray(ray_ind[:,0])
+        gray_ind_col_2 = cp.asarray(ray_ind[:,1])
+        gray_ind_col_3 = cp.asarray(ray_ind[:,2])
+        gdr = cp.asarray(dr, dtype=cp.float64)
+        gchishe = cp.asarray(self.chishe, dtype=cp.float64)
+        gchismet = cp.asarray(self.chismet_0, dtype=cp.float64)
+        gchivhe = cp.asarray(self.chivhe, dtype=cp.float64)
+        gchivmet = cp.asarray(self.chivmet_0, dtype=cp.float64) 
+        gden = cp.asarray(self.den, dtype=cp.float64)
+        #define kernel constants
+        n_nu = len(gnu)
+        
+        n_ipos = gtau_i_j.shape[1]
+        threads_per_block = 256
 
-    def ray_trace_4(self, ray_ind, dr, initial_pos, final_pos):
-        tau_i_j = np.zeros((len(final_pos),len(initial_pos),len(self.nu)))
-        red = self.redshift(initial_pos,final_pos,ray_ind,self.svels)
-        ind_all = np.unique(ray_ind[:,1])
-        split_inds = np.array_split(ind_all,max(len(ind_all)/100,1))
+        diff_nu = cp.min(cp.abs(cp.diff(gnu)/gnu[1:]))
+        bool_red = self.bool_red_kernel(gredshift, diff_nu)
+        ind_true = cp.arange(len(gmetals))
+        ind_all = cp.unique(gray_ind_col_2[cp.isin(gray_ind_col_2,ind_true)])
+        ray_ind_arange = cp.arange(len(ray_ind))
+        temp_ind = cp.unique(gi_temp[ind_all])
+        split_inds = cp.array_split(ind_all, int(max(len(ind_all) / 50, 1)))
+        bool_in_sum = cp.zeros(gray_ind_col_1.shape[0])
+        #print(bool_in_sum.shape)
         bigcount = 0
+        for ind_i, inds in enumerate(split_inds):
+            count = 0
+            temp_j = cp.minimum(cp.searchsorted(temp_ind, gi_temp[inds]), len(temp_ind)-1)
+            Z = cp.expand_dims(gmetals[inds], axis=1)
+            chiden = (cp.expand_dims(gden[inds], axis=1) / mH)
+            chix = self.chix_kernel(Z, gchishe[temp_j], gchismet[temp_j], gchivhe[temp_j], gchivmet[temp_j], chiden)
+
+            bool_in = cp.isin(gray_ind_col_2, inds)
+            ray_ind_i = ray_ind_arange[bool_in]
+            i_s, t_s, j_s = gray_ind_col_1[bool_in], gray_ind_col_2[bool_in], gray_ind_col_3[bool_in]
+            n_rays = len(i_s)
+            chi_ind = cp.searchsorted(inds, t_s)
+            drt = gdr[bool_in]
+            # len_y = cp.arange(len(i_s))
+            # bool_y_red = bool_red[ray_ind_i]
+            # cp.logical_not(bool_y_red, out=bool_y_red)
+            blocks_per_ray = (n_nu + threads_per_block - 1) // threads_per_block
+            grid = (n_rays, blocks_per_ray)
+            block = (threads_per_block,)
+            print("blocks_per_ray:", blocks_per_ray)
+            print("threads_per_block:", threads_per_block)
+            print("coverage:", blocks_per_ray * threads_per_block)
+            print("n_nu:", n_nu)
+            red = cp.ones_like(gredshift[ray_ind_i])
+            #gredshift[cp.abs(gredshift - 1.0) < 1e-14] = 1.0
+            self.batch_interp_kernel(
+                grid, block,
+                (gnu, red, chix, chi_ind, drt, i_s, j_s, 
+                n_nu, n_rays, n_ipos, gtau_i_j)
+            )
+            cp.cuda.Stream.null.synchronize()
+            # cupyx.scatter_add(gtau_i_j, (i_s[bool_y_red], j_s[bool_y_red]), cp.expand_dims(drt[bool_y_red], axis=1)*chix[chi_ind[bool_y_red]])
+            # for y in len_y[bool_red[ray_ind_i]]:
+            #     chix_t = cp.interp(gnu,gnu*gredshift[ray_ind_i[y]],chix[chi_ind[y]])
+            #     gtau_i_j[i_s[y],j_s[y]] += drt[y]*chix_t
+            bool_in_sum += bool_in
+            # del chix
+
+        bigcount = bool_in_sum.sum()
+        cp.exp(-gtau_i_j, out=gtau_i_j)
+        cpu_tau = cp.asnumpy(gtau_i_j)
+        return cpu_tau, bigcount
+    
+    def ray_trace_4_cpu(self,ray_ind,dr,final_pos,initial_pos):
+        tau_i_j = np.zeros((len(final_pos),len(initial_pos),len(self.nu)))
+        # red = self.redshift(initial_pos,final_pos,ray_ind,self.svels)
+        red = np.ones(len(ray_ind))
+        #ind_all = np.unique(ray_ind[:,1])
+        bigcount = 0
+        #time_piece = np.zeros(2)
         diff_nu = np.abs(np.diff(self.nu)/self.nu[1:]).min()
         bool_red = np.abs(red-1) > 0.5*diff_nu
-        for ind_i,inds in enumerate(split_inds):
-            count = 0
-            chix = {}
-            temp_j = self.i_temp[inds]
-            inds_list = np.arange(len(inds))
-            Z = self.metals[inds][:,np.newaxis]
-            DGRm = mH*10**(2.445*np.log10(Z)-2.029)
-            #chix = self.chisdust_0[temp_j]*DGRm + self.chishe[temp_j] + Z*self.chismet_0[temp_j] +\
-            #                            self.chivdust_0[temp_j]*DGRm + self.chivhe[temp_j] + Z*self.chivmet_0[temp_j]
-            chix =  self.chishe[temp_j] + Z*self.chismet_0[temp_j] +\
-                                       self.chivhe[temp_j] + Z*self.chivmet_0[temp_j]
-            #chix * den[cell] / mH = optical depth
-            chix *= self.den[inds,np.newaxis]/mH
-            chix = {t: chix[i] for i,t in enumerate(inds)}
-            bool_in = np.isin(ray_ind[:,1],inds)
-            ray_ind_i = np.arange(len(ray_ind))[bool_in]
-            i_s, t_s, j_s = ray_ind[bool_in][:,0],ray_ind[bool_in][:,1],ray_ind[bool_in][:,2]
-            drt = dr[bool_in]
-            for y in range(len(i_s)):
-                if bool_red[ray_ind_i[y]]:
-                    chix_t = np.interp(self.nu,self.nu*red[ray_ind_i[y]],chix[t_s[y]])
-                    tau_i_j[i_s[y]][j_s[y]] += drt[y]*chix_t
-                else:
-                    tau_i_j[i_s[y]][j_s[y]] += drt[y]*chix[t_s[y]]
-            count += bool_in.sum()
-            bigcount += count
-        chix = {}
+        np.arange(len(self.metals))
+        ind_true = np.arange(len(self.metals))
+        ind_all_0 = ray_ind[:,1][np.isin(ray_ind[:,1],ind_true)]
+        if len(ind_all_0 )>0:
+            ind_all = np.unique(ind_all_0)
+            self.temp_ind = np.unique(self.i_temp[ind_all])
+            split_inds = np.array_split(ind_all,max(len(ind_all)/50,1))
+            for ind_i,inds in enumerate(split_inds):
+                count = 0
+                chix = {}
+                temp_j = np.minimum(np.searchsorted(self.temp_ind,self.i_temp[inds]),len(self.temp_ind)-1)
+                # timei = time.time()
+                Z = self.metals[inds][:,np.newaxis]
+                # DGRm = mH*10**(2.445*np.log10(Z)-2.029)
+                chix = self.chishe[temp_j] + 0.0204*Z*self.chismet_0[temp_j] +\
+                                                self.chivhe[temp_j] + 0.0204*Z*self.chivmet_0[temp_j]
+                chix *= self.den[inds,np.newaxis]/mH
+                #print(chix[0,0])
+                bool_in = np.isin(ray_ind[:,1],inds)
+                ray_ind_i = np.arange(len(ray_ind))[bool_in]
+                i_s, t_s, j_s = ray_ind[bool_in][:,0],ray_ind[bool_in][:,1],ray_ind[bool_in][:,2]
+                chi_ind = np.searchsorted(inds,t_s)
+                drt = dr[bool_in]
+                len_y = np.arange(len(i_s))
+                bool_y_red = np.logical_not(bool_red[ray_ind_i])
+                np.add.at(tau_i_j,(i_s[bool_y_red],j_s[bool_y_red]),drt[bool_y_red,np.newaxis]*(chix[chi_ind[bool_y_red]]))
+                for y in len_y[bool_red[ray_ind_i]]:
+                        chix_t = np.interp(self.nu,self.nu*red[ray_ind_i[y]],chix[chi_ind[y]])
+                        tau_i_j[i_s[y],j_s[y]] += drt[y]*chix_t
+                count += bool_in.sum()
+                bigcount += count
+                chix = None
+        #print(tau_i_j[0,0,5])
         tau_i_j = np.exp(-tau_i_j)
+
         return tau_i_j,bigcount
-    
-
-    def par_ray_trace_4(self, ray_ind, dr, initial_pos, final_pos):
-        nu_gpu = cp.asarray(self.nu)
-        tau_ij_gpu = cp.zeros((len(final_pos),len(initial_pos),len(self.nu)))
-        ray_ind_gpu = cp.asarray(ray_ind)
-        dr_gpu = cp.asarray(dr)
-        red = self.redshift(initial_pos,final_pos,ray_ind,self.svels)
-        red_gpu = cp.asarray(red)
-        ind_all = np.unique(ray_ind[:,1])
-        split_inds = np.array_split(ind_all,max(len(ind_all)/100,1))
-        diff_nu = cp.min(cp.abs(cp.diff(nu_gpu)/nu_gpu[1:]))
-        bool_red = cp.abs(red_gpu-1) > 0.5*diff_nu
-        chishe_gpu_all = cp.asarray(self.chishe)
-        chismet_gpu_all = cp.asarray(self.chismet_0)
-        chivhe_gpu_all = cp.asarray(self.chivhe)
-        chivmet_gpu_all = cp.asarray(self.chivmet_0)
-
-        for ind_i, inds in enumerate(split_inds):
-            temp_j = self.i_temp[inds]
-
-            Z = self.metals[inds][:,np.newaxis]
-            z_gpu = cp.asarray(Z)
-            # GPU - accelerated
-            DGRm = mH*10**(2.445*cp.log10(z_gpu)-2.029) #elementwise kernel here?
-            # chix = chisdust_gpu*DGRm + chishe_gpu + Z*chismet_gpu +\
-            #                             chivdust_gpu*DGRm + chivhe_gpu + Z*chivmet_gpu
-            chix = chishe_gpu_all[temp_j] + z_gpu*chismet_gpu_all[temp_j] +\
-                                         chivhe_gpu_all[temp_j] + z_gpu*chivmet_gpu_all[temp_j]
-            
-            den_i_gpu = cp.asarray(self.den[inds,np.newaxis])
-            chix *= (den_i_gpu/mH)
-            
-            #chix = {t: chix[i] for i,t in enumerate(inds)}
-            inds_gpu = cp.asarray(inds)
-            bool_in = cp.isin(ray_ind_gpu[:,1],inds_gpu)
-            ray_ind_i = cp.arange(len(ray_ind_gpu))[bool_in]
-            ind_s = ray_ind_gpu[bool_in]
-            #i_s, t_s, j_s = ray_ind[bool_in][:,0],ray_ind[bool_in][:,1],ray_ind[bool_in][:,2]
-            drt = dr_gpu[bool_in]
-            bool_red_i = bool_red[ray_ind_i]
-            len_y = cp.arange(ind_s.shape[0])
-            for y in len_y[bool_red_i]:
-                if bool_red[ray_ind_i[y]]:
-                    chix_t = cp.interp(nu_gpu,nu_gpu*red_gpu[ray_ind_i[y]],chix[ind_s[y, 1]])
-                    tau_ij_gpu[ind_s[y, 0]][ind_s[y, 2]] += drt[y]*chix_t
-                else:
-                    tau_ij_gpu[ind_s[y, 0]][ind_s[y, 2]] += drt[y]*chix[ind_s[y, 1]]
-        tau_ij_gpu = cp.exp(-tau_ij_gpu)
-        return tau_ij_gpu.get()
-
 
 
 if __name__ == "__main__":
@@ -278,8 +439,9 @@ if __name__ == "__main__":
     halo_version = 2020 #updated from local file
     h_0 = Halo(0)
 
-    job_split = np.array_split(np.arange(len(h_0.spos)),np.maximum(len(h_0.spos)/50,1))
+    job_split = np.array_split(np.arange(len(h_0.spos)),np.maximum(len(h_0.spos)/1,1))
     i_stars = job_split[0]
+    print(len(i_stars))
     ipos_test = h_0.spos[i_stars]
     fpos_test = ((h_0.ll+h_0.ur)/2)[i_stars]
 
@@ -288,21 +450,65 @@ if __name__ == "__main__":
     # dr_cpu, ray_ind_cpu = h_0.ray_trace_1(initial_pos=ipos_test, final_pos=fpos_test)
     # print('CPU run complete. Took {}s'.format(time.time() - s_t))
 
+    # chix = cp.array(h_0.chivhe[30], dtype=cp.float64)
+    # nu = cp.array(h_0.nu, dtype=cp.float64)
+    # red = cp.float64(2)
+    # n_nu = len(nu)
+    # out_arr = cp.zeros_like(h_0.nu)
+    # threads_per_block = 256
+    # blocks_per_ray = (n_nu +threads_per_block - 1) // threads_per_block
+    # grid = (blocks_per_ray, 1)
+    # block = (threads_per_block, )
+    # plt.figure()
+    # plt.xlabel('Wavelength')
+    # plt.ylabel('Redshifted chivhe (GPU)')
+    # plt.semilogx()
+    # for i in range(1, 11):
+    #     red = cp.float64(i)
+    #     h_0.interp_kernel(grid, block, (nu, red, chix, n_nu, out_arr))
+    #     out_cpu = out_arr.get()
+    #     out_numpy = np.interp(h_0.nu, h_0.nu*i, h_0.chivhe[30])
+    #     plt.plot(h_0.nu[h_0.nu > 1e14], np.abs(out_cpu[h_0.nu > 1e14] - out_numpy[h_0.nu > 1e14]) / out_numpy[h_0.nu > 1e14],  label = str('Redshift = ' + str(i)))
+    # plt.legend()
+    # plt.show()
+
+
+
+    if (cp.cuda.is_available()):
+        print("GPU available: {}".format(cp.cuda.Device().id))
     print('Running GPU-Side Test: Ray Trace 1')
     s_t  = time.time()
     dr_gpu, ray_ind_gpu = h_0.par_ray_trace_1(initial_pos=ipos_test, final_pos=fpos_test)
     print('GPU run complete. Took {}s'.format(time.time() - s_t))
 
-    # # print(dr_cpu, dr_gpu)
-    # # print(ray_ind_cpu, ray_ind_gpu)
-
-    # print('Running CPU-Side Test: Ray Trace 4')
-    # s_t  = time.time()
-    # dr_cpu, ray_ind_cpu = h_0.ray_trace_4(ray_ind=ray_ind_cpu, dr=dr_cpu, initial_pos=ipos_test, final_pos=fpos_test)
-    # print('CPU run complete. Took {}s'.format(time.time() - s_t))
+    # # print(np.abs(dr_cpu - dr_gpu))
+    # # print(np.abs(ray_ind_cpu - ray_ind_gpu))
 
     print('Running GPU-Side Test: Ray Trace 4')
     s_t  = time.time()
-    tau_gpu = h_0.par_ray_trace_4(ray_ind=ray_ind_gpu, dr=dr_gpu, initial_pos=ipos_test, final_pos=fpos_test)
+    tau_gpu, bigcount = h_0.exp_prt_4(ray_ind_gpu, dr_gpu, ipos_test, fpos_test)
     print('GPU run complete. Took {}s'.format(time.time() - s_t))
+
+    print('Running CPU-Side Test: Ray Trace 4')
+    s_t = time.time()
+    tau_cpu, bigcount_cpu = h_0.ray_trace_4_cpu(ray_ind_gpu, dr_gpu, ipos_test, fpos_test)
+    print('CPU run complete. Took {}s'.format(time.time() - s_t))
+    print(bigcount, bigcount_cpu)
+
+    print(tau_cpu.shape, tau_gpu.shape)
+    plt.figure()
+    plt.xlabel('Wavelength')
+    plt.ylabel('Absorption')
+    plt.semilogx()
+    plt.plot(h_0.nu, tau_cpu[0][0], label="CPU idx 0,0")
+    plt.plot(h_0.nu, tau_gpu[0][0], label="GPU idx 0,0")
+    # plt.plot(h_0.nu, np.abs(tau_cpu[7][8] - tau_gpu[7][8]), label="Abs. diff")
+    # plt.plot(h_0.nu, np.abs(tau_cpu[0][0] - tau_gpu[0][0]), label="abs diff")
+    plt.legend()
+    plt.show()
+    # print(np.abs(tau_cpu-tau_gpu))
+    
+
+    # print(benchmark(h_0.par_ray_trace_4, args=(ray_ind_gpu, dr_gpu, ipos_test, fpos_test), n_repeat=10))
+    # print(benchmark(h_0.ray_trace_4, args=(ray_ind_gpu, dr_gpu, ipos_test, fpos_test), n_repeat=10))
 
