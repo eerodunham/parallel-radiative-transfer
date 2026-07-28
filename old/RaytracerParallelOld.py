@@ -134,9 +134,8 @@ class Halo:
                         val = y0 + ((y1 - y0) / (x1 - x0)) * (red_gnu-x0);
                     }
                 }
-
-                int out_idx = i_s[ray_idx] * (n_ipos * n_nu) + j_s[ray_idx] * n_nu + nu_idx;
-                atomicAdd(&gtau[out_idx], drt[ray_idx] * val);
+                int index = i_s[ray_idx] * n_ipos * n_nu + j_s[ray_idx] * n_nu + nu_idx;
+                atomicAdd(&gtau[index], drt[ray_idx]*val);
             }
         }
         ''', 'batch_interp')
@@ -345,23 +344,22 @@ class Halo:
             chiden = (cp.expand_dims(gden[inds], axis=1) / mH)
             chix = self.chix_kernel(Z, gchishe[temp_j], gchismet[temp_j], gchivhe[temp_j], gchivmet[temp_j], chiden)
 
-            bool_in = cp.isin(gray_ind_col_2, inds)
+            # bool_in = cp.isin(gray_ind_col_2, inds)
+            bool_in = cp.array([0])
             ray_ind_i = ray_ind_arange[bool_in]
             i_s, t_s, j_s = gray_ind_col_1[bool_in], gray_ind_col_2[bool_in], gray_ind_col_3[bool_in]
             n_rays = len(i_s)
             chi_ind = cp.searchsorted(inds, t_s)
             drt = gdr[bool_in]
+            print("DRT shape: ", drt.shape)
+            print("Ray seg: ", n_rays)
             # len_y = cp.arange(len(i_s))
             # bool_y_red = bool_red[ray_ind_i]
             # cp.logical_not(bool_y_red, out=bool_y_red)
             blocks_per_ray = (n_nu + threads_per_block - 1) // threads_per_block
             grid = (n_rays, blocks_per_ray)
             block = (threads_per_block,)
-            print("blocks_per_ray:", blocks_per_ray)
-            print("threads_per_block:", threads_per_block)
-            print("coverage:", blocks_per_ray * threads_per_block)
-            print("n_nu:", n_nu)
-            red = cp.ones_like(gredshift[ray_ind_i])
+            red = cp.ones_like(gredshift[ray_ind_i]) * 2.0
             #gredshift[cp.abs(gredshift - 1.0) < 1e-14] = 1.0
             self.batch_interp_kernel(
                 grid, block,
@@ -373,18 +371,18 @@ class Halo:
             # for y in len_y[bool_red[ray_ind_i]]:
             #     chix_t = cp.interp(gnu,gnu*gredshift[ray_ind_i[y]],chix[chi_ind[y]])
             #     gtau_i_j[i_s[y],j_s[y]] += drt[y]*chix_t
-            bool_in_sum += bool_in
+            # bool_in_sum += bool_in
             # del chix
 
-        bigcount = bool_in_sum.sum()
-        cp.exp(-gtau_i_j, out=gtau_i_j)
+        # bigcount = bool_in_sum.sum()
+        # cp.exp(-gtau_i_j, out=gtau_i_j)
         cpu_tau = cp.asnumpy(gtau_i_j)
-        return cpu_tau, bigcount
+        return cpu_tau
     
     def ray_trace_4_cpu(self,ray_ind,dr,final_pos,initial_pos):
         tau_i_j = np.zeros((len(final_pos),len(initial_pos),len(self.nu)))
         # red = self.redshift(initial_pos,final_pos,ray_ind,self.svels)
-        red = np.ones(len(ray_ind))
+        red = np.ones(len(ray_ind)) * 2.0
         #ind_all = np.unique(ray_ind[:,1])
         bigcount = 0
         #time_piece = np.zeros(2)
@@ -407,12 +405,13 @@ class Halo:
                 chix = self.chishe[temp_j] + 0.0204*Z*self.chismet_0[temp_j] +\
                                                 self.chivhe[temp_j] + 0.0204*Z*self.chivmet_0[temp_j]
                 chix *= self.den[inds,np.newaxis]/mH
-                #print(chix[0,0])
-                bool_in = np.isin(ray_ind[:,1],inds)
+                # bool_in = np.isin(ray_ind[:,1],inds)
+                bool_in  = np.array([0])
                 ray_ind_i = np.arange(len(ray_ind))[bool_in]
                 i_s, t_s, j_s = ray_ind[bool_in][:,0],ray_ind[bool_in][:,1],ray_ind[bool_in][:,2]
                 chi_ind = np.searchsorted(inds,t_s)
                 drt = dr[bool_in]
+                print("DRT shape (CPU): ", drt.shape)
                 len_y = np.arange(len(i_s))
                 bool_y_red = np.logical_not(bool_red[ray_ind_i])
                 np.add.at(tau_i_j,(i_s[bool_y_red],j_s[bool_y_red]),drt[bool_y_red,np.newaxis]*(chix[chi_ind[bool_y_red]]))
@@ -423,9 +422,9 @@ class Halo:
                 bigcount += count
                 chix = None
         #print(tau_i_j[0,0,5])
-        tau_i_j = np.exp(-tau_i_j)
+        # tau_i_j = np.exp(-tau_i_j)
 
-        return tau_i_j,bigcount
+        return tau_i_j
 
 
 if __name__ == "__main__":
@@ -439,7 +438,7 @@ if __name__ == "__main__":
     halo_version = 2020 #updated from local file
     h_0 = Halo(0)
 
-    job_split = np.array_split(np.arange(len(h_0.spos)),np.maximum(len(h_0.spos)/1,1))
+    job_split = np.array_split(np.arange(len(h_0.spos)),np.maximum(len(h_0.spos)/10, 1))
     i_stars = job_split[0]
     print(len(i_stars))
     ipos_test = h_0.spos[i_stars]
@@ -486,22 +485,21 @@ if __name__ == "__main__":
 
     print('Running GPU-Side Test: Ray Trace 4')
     s_t  = time.time()
-    tau_gpu, bigcount = h_0.exp_prt_4(ray_ind_gpu, dr_gpu, ipos_test, fpos_test)
+    tau_gpu= h_0.exp_prt_4(ray_ind_gpu, dr_gpu, ipos_test, fpos_test)
     print('GPU run complete. Took {}s'.format(time.time() - s_t))
 
     print('Running CPU-Side Test: Ray Trace 4')
     s_t = time.time()
-    tau_cpu, bigcount_cpu = h_0.ray_trace_4_cpu(ray_ind_gpu, dr_gpu, ipos_test, fpos_test)
+    tau_cpu = h_0.ray_trace_4_cpu(ray_ind_gpu, dr_gpu, ipos_test, fpos_test)
     print('CPU run complete. Took {}s'.format(time.time() - s_t))
-    print(bigcount, bigcount_cpu)
 
     print(tau_cpu.shape, tau_gpu.shape)
     plt.figure()
     plt.xlabel('Wavelength')
     plt.ylabel('Absorption')
     plt.semilogx()
-    plt.plot(h_0.nu, tau_cpu[0][0], label="CPU idx 0,0")
-    plt.plot(h_0.nu, tau_gpu[0][0], label="GPU idx 0,0")
+    plt.plot(h_0.nu, tau_cpu[0][0], label="CPU idx 0,0", alpha=0.3)
+    plt.plot(h_0.nu, tau_gpu[0][0], label="GPU idx 0,0", alpha = 0.3)
     # plt.plot(h_0.nu, np.abs(tau_cpu[7][8] - tau_gpu[7][8]), label="Abs. diff")
     # plt.plot(h_0.nu, np.abs(tau_cpu[0][0] - tau_gpu[0][0]), label="abs diff")
     plt.legend()
