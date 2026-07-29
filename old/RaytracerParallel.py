@@ -360,9 +360,14 @@ class Halo:
             block = (threads_per_block,)
             red = cp.ones_like(gredshift[ray_ind_i])
             #gredshift[cp.abs(gredshift - 1.0) < 1e-14] = 1.0
+            #batch_interp_kernel expects int32
+            chi_ind32 = chi_ind.astype(cp.int32)
+            i_s32 = i_s.astype(cp.int32)
+            j_s32 = j_s.astype(cp.int32)
+
             self.batch_interp_kernel(
                 grid, block,
-                (gnu, red, chix, chi_ind, drt, i_s, j_s, 
+                (gnu, red, chix, chi_ind32, drt, i_s32, j_s32, 
                 n_nu, n_rays, n_fpos, gtau_i_j)
             )
             # cp.cuda.Stream.null.synchronize()
@@ -496,19 +501,19 @@ if __name__ == "__main__":
     
     print(tau_cpu.shape, tau_gpu.shape)
     plt.figure()
-    # fig, ax = plt.subplots(tau_cpu.shape[0], tau_cpu.shape[1], figsize=(10, 10))
-    # for axis in ax.flat:
-    #     axis.set(xlabel="Wavelength", ylabel="Absorption")
-    #     axis.semilogx()
+    fig, ax = plt.subplots(tau_cpu.shape[0], tau_cpu.shape[1], figsize=(10, 10))
+    for axis in ax.flat:
+        axis.set(xlabel="Wavelength", ylabel="Absorption")
+        axis.semilogx()
     
-    # for i in range(ipos_test.shape[0]):
-    #     for j in range(fpos_test.shape[0]):
-    #         ax[i, j].plot(h_0.nu, tau_cpu[i][j], alpha=0.4)
-    #         ax[i, j].plot(h_0.nu, tau_gpu[i][j], alpha=0.4)
-    #         ax[i, j].set_title('Tau [{}, {}]'.format(i, j))
+    for i in range(ipos_test.shape[0]):
+        for j in range(fpos_test.shape[0]):
+            ax[i, j].plot(h_0.nu, tau_cpu[i][j], alpha=0.4)
+            ax[i, j].plot(h_0.nu, tau_gpu[i][j], alpha=0.4)
+            ax[i, j].set_title('Tau [{}, {}]'.format(i, j))
     
-    plt.plot(h_0.nu, np.abs(tau_cpu[2][3]), alpha=0.4, label="CPU")
-    plt.plot(h_0.nu, np.abs(tau_gpu[1][0]), alpha=0.4, label="GPU")
+    # plt.plot(h_0.nu, np.abs(tau_cpu[1][0]), alpha=0.4, label="CPU")
+    # plt.plot(h_0.nu, np.abs(tau_gpu[1][0]), alpha=0.4, label="GPU")
     # fig.suptitle('{}x{} Tau grid: CPU-GPU comparison'.format(tau_cpu.shape[0], tau_cpu.shape[1]))
     plt.legend()
     # fig.tight_layout() 
