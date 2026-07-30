@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 import numpy as np
-import h5py
 try:
     import yt
 except ImportError:
@@ -10,12 +9,12 @@ except ImportError:
 INT_DTYPE = np.int32
 FLOAT_DTYPE= np.float64
 
-def _write_dataset(h5file, name, arr, dtype):
+#Simple NPY file writer that parses an enzogrid and dumps the required information for radiative transfer.
+
+def write_npy(path, arr, dtype):
     arr = np.ascontiguousarray(arr, dtype=dtype)
-    ds = h5file.create_dataset(name, data=arr, dtype=dtype)
-    ds.attrs["shape"] = np.array(arr.shape, dtype=np.int64)
-    ds.attrs["dtype"] = np.dtype(dtype).name
-    return ds
+    np.save(path, arr)
+    return path
 
 class Exporter:
     def __init__(self, data_path, timestep=0, halo_ver=2020, test=True):
@@ -118,42 +117,36 @@ class Exporter:
         self.chisdust_0 = chisdust[np.newaxis, :].astype(FLOAT_DTYPE)
         self.chivdust_0 = chivdust[np.newaxis, :].astype(FLOAT_DTYPE)
     def _export(self, dump_path):
-        os.makedirs(dump_path, exist_ok=True)
-        out_file = os.path.join(dump_path, "halo_t%03d.h5" % self.timestep)
-        with h5py.File(out_file, "w") as f:
-            f.attrs["timestep"] = self.timestep
-            f.attrs["halo_version"] = self.halo_ver
-            f.attrs["n_cells"] = self.ll.shape[0]
-            f.attrs["n_stars"] = self.spos.shape[0]
-            f.attrs["n_nu"] = self.nu.shape[0]
-            grid = f.create_group("grid")
-            _write_dataset(grid, "ll", self.ll, FLOAT_DTYPE)
-            _write_dataset(grid, "ur", self.ur, FLOAT_DTYPE)
-            _write_dataset(grid, "dds", self.dds, FLOAT_DTYPE)
-            _write_dataset(grid, "velocity", self.vel, FLOAT_DTYPE)
-            _write_dataset(grid, "temperature", self.temps, FLOAT_DTYPE)
-            _write_dataset(grid, "metallicity", self.metals, FLOAT_DTYPE)
-            _write_dataset(grid, "density", self.den, FLOAT_DTYPE)
-            _write_dataset(grid, "i_temp", self.i_temp, INT_DTYPE)
-            _write_dataset(grid, "ll_box", self.ll_box, FLOAT_DTYPE)
-            _write_dataset(grid, "ur_box", self.ur_box, FLOAT_DTYPE)
-            stars = f.create_group("stars")
-            _write_dataset(stars, "positions", self.spos, FLOAT_DTYPE)
-            _write_dataset(stars, "velocities", self.svels, FLOAT_DTYPE)
-            chi = f.create_group("chi_table")
-            _write_dataset(chi, "nu", self.nu, FLOAT_DTYPE)
-            _write_dataset(chi, "chishe", self.chishe, FLOAT_DTYPE)
-            _write_dataset(chi, "chismet_0", self.chismet_0, FLOAT_DTYPE)
-            _write_dataset(chi, "chivhe", self.chivhe, FLOAT_DTYPE)
-            _write_dataset(chi, "chivmet_0", self.chivmet_0, FLOAT_DTYPE)
-            if self.emiss_dust_0 is not None:
-                dust = f.create_group("dust")
-                _write_dataset(dust, "emiss_dust_0", self.emiss_dust_0, FLOAT_DTYPE)
-                _write_dataset(dust, "dust_nrg", self.dust_nrg, FLOAT_DTYPE)
-                _write_dataset(dust, "chisdust_0", self.chisdust_0, FLOAT_DTYPE)
-                _write_dataset(dust, "chivdust_0", self.chivdust_0, FLOAT_DTYPE)
-        print("Wrote %s" % out_file)
-        return out_file
+        out_dir = os.path.join(dump_path, "halo_t%03d" % self.timestep)
+        os.makedirs(out_dir, exist_ok=True)
+        write_npy(os.path.join(out_dir, "grid_ll.npy"), self.ll, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_ur.npy"), self.ur, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_dds.npy"), self.dds, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_velocity.npy"), self.vel, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_temperature.npy"), self.temps, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_metallicity.npy"), self.metals, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_density.npy"), self.den, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_i_temp.npy"), self.i_temp, INT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_ll_box.npy"), self.ll_box, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "grid_ur_box.npy"), self.ur_box, FLOAT_DTYPE)
+
+        write_npy(os.path.join(out_dir, "stars_positions.npy"), self.spos, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "stars_velocities.npy"), self.svels, FLOAT_DTYPE)
+
+        write_npy(os.path.join(out_dir, "chi_nu.npy"), self.nu, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "chi_chishe.npy"), self.chishe, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "chi_chismet_0.npy"), self.chismet_0, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "chi_chivhe.npy"), self.chivhe, FLOAT_DTYPE)
+        write_npy(os.path.join(out_dir, "chi_chivmet_0.npy"), self.chivmet_0, FLOAT_DTYPE)
+
+        if self.emiss_dust_0 is not None:
+            write_npy(os.path.join(out_dir, "dust_emiss_dust_0.npy"), self.emiss_dust_0, FLOAT_DTYPE)
+            write_npy(os.path.join(out_dir, "dust_dust_nrg.npy"), self.dust_nrg, FLOAT_DTYPE)
+            write_npy(os.path.join(out_dir, "dust_chisdust_0.npy"), self.chisdust_0, FLOAT_DTYPE)
+            write_npy(os.path.join(out_dir, "dust_chivdust_0.npy"), self.chivdust_0, FLOAT_DTYPE)
+
+        print("Wrote %s" % out_dir)
+        return out_dir
 
 def main():
     parser = argparse.ArgumentParser(

@@ -11,10 +11,9 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 set(CMAKE_CUDA_ARCHITECTURES native) 
-
 find_package(CUDAToolkit REQUIRED)
 
-add_library(raytracer_core
+add_library(raytracer_core STATIC
 	src/device/rt1.cu
 	src/device/rt4.cu
 	src/device/utils.cu
@@ -30,3 +29,5 @@ add_executable(raytracer_main src/host/main.cpp)
 target_link_libraries(raytracer_main PRIVATE raytracer_core)
 enable_testing()
 add_subdirectory(tests)
+
+
