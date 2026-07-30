@@ -80,8 +80,17 @@ private:
 	size_t _size = 0;
 };
 
-// Struct of Arrays style abstraction
-
+struct GridData
+{
+	size_t num_stars = 0;
+	size_t num_cells = 0;
+	size_t num_wav = 70000;
+};
+struct AABB
+{
+	DeviceArray<float3> ll;
+	DeviceArray<float3> ur;
+};
 // Data for all Ray Segments
 struct RayIndex
 {
