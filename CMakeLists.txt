@@ -13,6 +13,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_CUDA_ARCHITECTURES native) 
 find_package(CUDAToolkit REQUIRED)
 
+add_library(cub::cub INTERFACE IMPORTED)
+target_include_directories(cub::cub INTERFACE ${CUDAToolkit_INCLUDE_DIRS})
+
 add_library(raytracer_core STATIC
 	src/device/rt1.cu
 	src/device/rt4.cu
@@ -20,7 +23,11 @@ add_library(raytracer_core STATIC
 	src/host/load.cpp
 )
 target_include_directories(raytracer_core PUBLIC include)
-target_link_libraries(raytracer_core PUBLIC CUDA::cudart)
+target_link_libraries(raytracer_core 
+	PUBLIC 
+		CUDA::cudart
+		cub::cub
+)
 set_target_properties(raytracer_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON

@@ -72,8 +72,8 @@ struct DeviceArray
 		CUDA_CHECK(cudaFree(_data));
 	}
 
-	T *data() { return _data; }
-	size_t size() { return _size; }
+	T *data() const { return _data; }
+	size_t size() const { return _size; }
 
 private:
 	T *_data = nullptr;
@@ -88,8 +88,8 @@ struct GridData
 };
 struct AABB
 {
-	DeviceArray<float3> ll;
-	DeviceArray<float3> ur;
+	DeviceArray<double3> ll;
+	DeviceArray<double3> ur;
 };
 // Data for all Ray Segments
 struct RayIndex
