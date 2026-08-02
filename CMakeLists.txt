@@ -20,7 +20,7 @@ add_library(raytracer_core STATIC
 	src/device/rt1.cu
 	src/device/rt4.cu
 	src/device/utils.cu
-	src/host/load.cpp
+	src/host/raytracer.cpp
 )
 target_include_directories(raytracer_core PUBLIC include)
 target_link_libraries(raytracer_core 
