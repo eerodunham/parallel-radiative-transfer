@@ -22,7 +22,7 @@ add_library(raytracer_core STATIC
 	src/device/utils.cu
 	src/host/halo.cpp
 )
-target_include_directories(raytracer_core PUBLIC include)
+target_include_directories(raytracer_core PUBLIC include src/host)
 target_link_libraries(raytracer_core 
 	PUBLIC 
 		CUDA::cudart

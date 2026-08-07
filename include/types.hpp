@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cassert>
+#include <cstdlib>
+#include <iostream>
 
 #define CUDA_CHECK(err)                                        \
 	if (err != cudaSuccess)                                    \
