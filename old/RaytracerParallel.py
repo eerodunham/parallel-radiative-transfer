@@ -12,6 +12,174 @@ import matplotlib.pyplot as plt
 
 os.environ['CUPY_ACCELERATORS'] = 'cub_python'
 
+def cupy_ray_trace_1(ipos, fpos, ll, ur):
+    '''define custom kernels'''
+    bool_tmin_kernel = cp.ElementwiseKernel(
+                'T tmax, T tmin',  
+                'bool bool_tmin',        
+                '''
+                bool_tmin = (tmin < tmax) & (tmin < 1) & (tmax > 0);
+                ''', 
+                'bool_tmin_kernel'    
+            )
+    ll_g = cp.asarray(ll, dtype=cp.float64)
+    ur_g = cp.asarray(ur, dtype=cp.float64)
+    ipos_g = cp.asarray(ipos, dtype=cp.float64)
+    fpos_g = cp.asarray(fpos, dtype=cp.float64)
+    M = (cp.expand_dims(fpos_g, axis=1) - ipos_g)
+    ll_ind = cp.arange(ll_g.shape[0])
+    ll_max = max(ll_g.shape[0]//200, 1)
+    split_ll_g = cp.array_split(ary=ll_ind, indices_or_sections=ll_max)
+    ray_ind = cp.array([], dtype=cp.int16)
+    ray_ind_list = []
+    tmin_list = []
+    tmax_list = []
+    for split_ll_i in split_ll_g:
+        t0 = (cp.expand_dims(ll_g[split_ll_i], axis=1) - ipos_g) / cp.expand_dims(M, axis=1) 
+        t1 = (cp.expand_dims(ur_g[split_ll_i], axis=1) - ipos_g) / cp.expand_dims(M, axis=1) 
+        tmin = cp.minimum(t0, t1) 
+        tmax = cp.maximum(t0, t1)
+        del t0, t1
+        tmin = cp.max(tmin, axis=3)
+        tmax = cp.min(tmax, axis=3)
+        bool_tmin = bool_tmin_kernel(tmax, tmin)
+        tmax_b = tmax[bool_tmin]
+        del tmax
+        tmin_b = tmin[bool_tmin]
+        del tmin
+        target_ind,cell_ind,star_ind = cp.where(bool_tmin)
+        del bool_tmin
+        ray_ind_g = cp.stack((target_ind, split_ll_i[cell_ind], star_ind), axis=1)
+        del target_ind, cell_ind, star_ind
+        tmin_list.append(tmin_b)
+        tmax_list.append(tmax_b)
+        ray_ind_list.append(ray_ind_g)
+    ray_ind = cp.vstack(ray_ind_list)
+    tmin_f = cp.concatenate(tmin_list)
+    tmax_f = cp.concatenate(tmax_list)
+    tmin_f_clamped = cp.maximum(tmin_f, 0)
+    del tmin_f
+    ray_ind_col2 = ray_ind[:, 2]
+    ray_ind_col0 = ray_ind[:,0]
+    p_close = cp.expand_dims(tmin_f_clamped, axis=1)*M[ray_ind_col0,ray_ind_col2]+ipos_g[ray_ind_col2]
+    p_far = cp.expand_dims(tmax_f, axis=1)*M[ray_ind_col0,ray_ind_col2]+ipos_g[ray_ind_col2]
+    dr = cp.linalg.norm(p_far-p_close, axis=1)
+    return dr.get(), ray_ind.get()
+
+
+def cupy_ray_trace_4(ray_ind, dr, ipos, fpos, nu, svels, metals, den, i_temp,
+                     chishe, chismet, chivhe, chivmet, redshift):
+    '''define custom kernels'''
+    chix_kernel = cp.ElementwiseKernel(
+                'T Z, T chishe, T chismet, T chivhe, T chivmet, T den',
+                'T chix',
+                '''
+                chix = (chishe + 0.0204*Z*chismet + chivhe + 0.0204*Z*chivmet) * den;
+                ''',
+                'chix_kernel'
+            )
+    batch_interp_kernel = cp.RawKernel(r'''
+            extern "C" __global__
+            void batch_interp(const double* gnu,      // [n_nu]
+                            const double* redshift, // [n_rays]
+                            const double* chix,     // [n_unique_inds, n_nu]
+                            const int* chi_ind,     // [n_rays]
+                            const double* drt,      // [n_rays]
+                            const int* i_s,         // [n_rays]
+                            const int* j_s,         // [n_rays]
+                            int n_nu,
+                            int n_rays,
+                            int n_fpos,
+                            double *tau)           // [n_fpos, n_ipos, n_nu]
+            {
+                int ray_idx = blockIdx.x;
+                int nu_idx = threadIdx.x + blockIdx.y * blockDim.x;
+                double eps = 1e-5;
+                if (ray_idx < n_rays && nu_idx < n_nu) {
+                    double val = 0;
+                    int row_offset = chi_ind[ray_idx] * n_nu;
+                    if(redshift[ray_idx] > 1.0f - eps && redshift[ray_idx] < 1.0f + eps) {
+                        val = chix[row_offset + nu_idx];
+                    } else {
+                        double red_gnu = gnu[nu_idx] / redshift[ray_idx];
+                        int low = 0;
+                        int mid = 0;
+                        int high = n_nu - 1;
+                        while (high - low > 1) {
+                            mid = (low + high) >> 1;
+                            bool go_right = (gnu[mid] < red_gnu);
+                            low = go_right ? mid : low;
+                            high = go_right ? high : mid;
+                        }
+                        if (low < 0) val = chix[row_offset];
+                        else if (low >= n_nu) val = chix[row_offset + n_nu - 1];
+                        else {
+                            double x0 = gnu[low];
+                            double x1 = gnu[low+1];
+                            double y0 = chix[row_offset + low];
+                            double y1 = chix[row_offset + low+1];
+                            val = y0 + ((y1 - y0) / (x1 - x0)) * (red_gnu-x0);
+                        }
+                    }
+                    int index = i_s[ray_idx] * n_fpos * n_nu + j_s[ray_idx] * n_nu + nu_idx;
+                    atomicAdd(&tau[index], drt[ray_idx] * val);
+                }
+            }
+            ''', 'batch_interp')
+    gtau_i_j = cp.zeros((len(fpos), len(ipos), len(nu)), dtype=cp.float64)
+    gredshift = cp.asarray(redshift(ipos, fpos, ray_ind, svels), dtype=cp.float64)
+    gnu = cp.asarray(nu, dtype=cp.float64)
+    gmetals = cp.asarray(metals, dtype=cp.float64)
+    gi_temp = cp.asarray(i_temp)
+    gray_ind = cp.asarray(ray_ind)
+    gdr = cp.asarray(dr, dtype=cp.float64)
+    gchishe = cp.asarray(chishe, dtype=cp.float64)
+    gchismet = cp.asarray(chismet, dtype=cp.float64)
+    gchivhe = cp.asarray(chivhe, dtype=cp.float64)
+    gchivmet = cp.asarray(chivmet, dtype=cp.float64) 
+    gden = cp.asarray(den, dtype=cp.float64)
+    n_nu = len(gnu)
+    n_fpos = gtau_i_j.shape[1]
+    threads_per_block = 256
+    ind_true = cp.arange(len(gmetals))
+    ind_all = cp.unique(gray_ind[:,1][cp.isin(gray_ind[:, 1],ind_true)])
+    ray_ind_arange = cp.arange(len(ray_ind))
+    temp_ind = cp.unique(gi_temp[ind_all])
+    print(len(ind_all))
+    split_inds = cp.array_split(ind_all, int(max(len(ind_all) / 200, 1)))
+    bool_in_sum = cp.zeros(gray_ind.shape[0])
+    bigcount = 0
+    for ind_i, inds in enumerate(split_inds):
+        temp_j = cp.minimum(cp.searchsorted(temp_ind, gi_temp[inds]), len(temp_ind)-1)
+        Z = cp.expand_dims(gmetals[inds], axis=1)
+        chiden = (cp.expand_dims(gden[inds], axis=1) / mH)
+        chix = chix_kernel(Z, gchishe[temp_j], gchismet[temp_j], gchivhe[temp_j], gchivmet[temp_j], chiden)
+        # chix = gchivhe[temp_j] * chiden #uncomment if testing simplified version
+        bool_in = cp.isin(gray_ind[:, 1], inds)
+        ray_ind_i = ray_ind_arange[bool_in]
+        i_s, t_s, j_s = gray_ind[bool_in][:,0],gray_ind[bool_in][:,1],gray_ind[bool_in][:,2]
+        print(len(i_s), len(j_s), len(t_s))
+        n_rays = len(i_s)
+        chi_ind = cp.searchsorted(inds, t_s)
+        drt = gdr[bool_in]
+        blocks_per_ray = (n_nu + threads_per_block - 1) // threads_per_block
+        grid = (n_rays, blocks_per_ray)
+        block = (threads_per_block,)
+        red = cp.ones_like(gredshift[ray_ind_i])
+        #batch_interp_kernel expects int32
+        chi_ind32 = chi_ind.astype(cp.int32)
+        i_s32 = i_s.astype(cp.int32)
+        j_s32 = j_s.astype(cp.int32)
+        batch_interp_kernel(
+            grid, block,
+            (gnu, red, chix, chi_ind32, drt, i_s32, j_s32, 
+            n_nu, n_rays, n_fpos, gtau_i_j)
+        )
+        bool_in_sum += bool_in
+    bigcount = bool_in_sum.sum()
+    cp.exp(-gtau_i_j, out=gtau_i_j)
+    return gtau_i_j.get(), bigcount
+
 class Halo:
     def __init__(self, timestep, testing=True):
         halo = np.load('halotree_2020_final.npy',allow_pickle=True).tolist()
