@@ -2,13 +2,14 @@ import yt
 import os,sys
 import random
 from scipy.spatial import cKDTree
-from SPS_reader import SSP_interpolator
+# from SPS_reader import SSP_interpolator
 import numpy as np
 import time as time
 from scipy.spatial import ConvexHull
 from scipy.spatial import distance
 from scipy.interpolate import interp1d
 import cupy as cp
+from cupyx.scipy.special import exp1
 
 yt.enable_parallelism()
 from mpi4py import MPI
@@ -274,7 +275,7 @@ class Radiative_Transfer():
 
         #Custom kernel to compute the interpolated and attenuated emission spectra 
         multiply_spectra = cp.ElementwiseKernel(
-                'raw float64 spectra, raw int64 source_lo, raw float64 source_w, raw bool_ past, float64 attenuation, int32 n_stars, int32 n_nu',
+                'raw float64 spectra, raw int64 source_lo, raw float64 source_w, raw bool past, float64 attenuation, int32 n_stars, int32 n_nu',
                 'float64 factor',
                 '''
                 int nu_i = i % n_nu;
@@ -911,7 +912,7 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
 
         #Custom kernel to compute the interpolated and attenuated emission spectra 
         multiply_spectra = cp.ElementwiseKernel(
-                'raw float64 spectra, raw int64 source_lo, raw float64 source_w, raw bool_ past, float64 attenuation, int32 n_stars, int32 n_nu',
+                'raw float64 spectra, raw int64 source_lo, raw float64 source_w, raw bool past, float64 attenuation, int32 n_stars, int32 n_nu',
                 'float64 factor',
                 '''
                 int nu_i = i % n_nu;
@@ -978,14 +979,14 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
         
         batch_interp_kernel = cp.RawKernel(r'''
                 extern "C" __global__
-                void batch_interp(const __restrict__ double* gnu,      // [n_nu]
-                                const __restrict__ double* redshift, // [n_rays]
-                                const __restrict__ double* chix,     // [n_unique_inds, n_nu]
-                                const __restrict__ int* chi_ind,     // [n_rays]
-                                const __restrict__ double* drt,      // [n_rays]
-                                const __restrict__ int* i_s,         // [n_rays]
-                                const __restrict__ int* j_s,         // [n_rays]
-                                int n_nu,
+                void batch_interp(const double* gnu,      // [n_nu]
+                                const double* __restrict__ redshift, // [n_rays]
+                                const double* __restrict__ chix,     // [n_unique_inds, n_nu]
+                                const int* __restrict__ chi_ind,     // [n_rays]
+                                const double* __restrict__ drt,      // [n_rays]
+                                const int* __restrict__ i_s,         // [n_rays]
+                                const int* __restrict__ j_s,         // [n_rays]
+                                int n_nu, 
                                 int n_rays,
                                 int n_fpos,
                                 double *tau,           // [n_fpos, n_ipos, n_nu]
@@ -995,7 +996,7 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
                 {
                     int ray_idx = blockIdx.x;
                     int nu_idx = threadIdx.x + blockIdx.y * blockDim.x;
-                    double eps = 1e-5;
+                    double eps = 1e-8;
                     if (ray_idx < n_rays && nu_idx < n_nu) {
                         double val = 0;
                         int row_offset = chi_ind[ray_idx] * n_nu;
@@ -1084,14 +1085,49 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
                 batch_interp_kernel(
                     grid, block,
                     (gnu, red, chix_i, chi_ind32, drt, i_s32, j_s32,
-                    n_nu, n_rays, n_fpos,is_target_cell_i, gtau_i_j,tau_cell))
+                    n_nu, n_rays, n_fpos, gtau_i_j, is_target_cell_i,tau_cell))
                 bool_in_sum += bool_in
             gtau_i_j -= tau_cell
             cp.exp(-gtau_i_j, out=gtau_i_j)
             ell = dr_cell[:,:,None]
             r0 = r0[:,:,None]
-            tau_cell[:] = (1/r0-cp.exp(-tau_cell)/(r0+ell)+(tau_cell/ell)*cp.exp(tau_cell*r0/ell)*\
-                (exp1(tau_cell*(r0+ell)/ell)-exp1(tau_cell*r0/ell)))/(4*cp.pi*ell)
+            
+            # 1. Identify zero-length segments to mask out later
+            mask_zero_ell = (ell == 0.0)
+            
+            # 2. Create "safe" variables to prevent CuPy from eager-evaluating divisions by zero
+            ell_safe = cp.where(mask_zero_ell, 1.0, ell)
+            r0_safe = cp.where(r0 == 0.0, 1e-10, r0) # Prevents 1/0 if source is dead center
+            tau_safe = cp.where(tau_cell == 0.0, 1.0, tau_cell) # Prevents 1/0 in asymp branch
+            
+            x0 = tau_cell * r0_safe / ell_safe
+            x1 = tau_cell * (r0_safe + ell_safe) / ell_safe
+            
+            # 3. Define the safe regime
+            safe_mask = x0 < 100.0 
+            
+            # 4. Sanitize inputs for the exact calculation so CuPy never computes inf * 0
+            x0_safe = cp.where(safe_mask, x0, 1.0)
+            x1_safe = cp.where(safe_mask, x1, 1.0)
+            
+            # Compute Exact Solution ONLY on sanitized arrays
+            exact_num = 1/r0_safe - cp.exp(-tau_cell)/(r0_safe+ell_safe) + \
+                        (tau_cell/ell_safe) * cp.exp(x0_safe) * (exp1(x1_safe) - exp1(x0_safe))
+            exact_solution = exact_num / (4*cp.pi*ell_safe)
+            
+            # Compute fully simplified Asymptotic Solution (1/r0 physically cancels out)
+            asymp_solution = 1 / (4 * cp.pi * tau_safe * r0_safe**2)
+            
+            # 5. Recombine based on the safe mask
+            tau_cell_new = cp.where(safe_mask, exact_solution, asymp_solution)
+            
+            # 6. Apply physical logic: zero-length segments contribute zero attenuation
+            tau_cell[:] = cp.where(mask_zero_ell, 0.0, tau_cell_new)
+             
+
+            # tau_cell[:] = (1/r0-cp.exp(-tau_cell)/(r0+ell)+(tau_cell/ell)*cp.exp(tau_cell*r0/ell)*\
+            #     (exp1(tau_cell*(r0+ell)/ell)-exp1(tau_cell*r0/ell)))/(4*cp.pi*ell)
+            
             gtau_i_j *= tau_cell
             gspectra = cp.asarray(spectra_times, dtype=cp.float64)
             gpast = cp.asarray(bool_past, dtype=cp.uint8)
