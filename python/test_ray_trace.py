@@ -42,6 +42,8 @@ def test_raytrace_mock(dataset_path, halo_tree_path, stars_path, halo_id, timest
     print(fpos.shape, ipos.shape)
     target_cells = np.arange(n_fpos, dtype=np.int64)
 
+
+    #can use opacity from plothype
     ''' MOCK DATA '''
 
     #mock freq bins
@@ -51,7 +53,7 @@ def test_raytrace_mock(dataset_path, halo_tree_path, stars_path, halo_id, timest
     #mock spectra times
     spectra_times = np.random.uniform(1e-22, 1e-20, size=(n_time_bins, n_ipos, n_nu))
     #mock opacity lookup
-    opacity = np.random.uniform(10.0, 100.0, size=(n_fpos, n_time_bins, n_nu))
+    opacity = 10**(np.random.uniform(-19, -17, size=(n_fpos, n_time_bins, n_nu)))
     #mock temporal indexing arrays
     source_lo = np.random.randint(0, n_time_bins - 1, size=(n_fpos, n_ipos), dtype=np.int64)
     source_w = np.random.uniform(0.0, 1.0, size=(n_fpos, n_ipos))
@@ -117,6 +119,10 @@ if __name__ == "__main__":
     n_ipos = 2
     n_fpos = 2
     n_nu = 10
-    n_time_bins = 10
+    n_time_bins = 5
     test_raytrace_mock(dataset_path, halo_tree, star_list, halo_id, timestep, n_ipos, n_fpos, n_nu, n_time_bins)
     print("TEST COMPLETE")
+
+#chunking is 500 ipos 50 fpos 2000 nu
+
+#rt1 is possible target for fp32
