@@ -988,7 +988,7 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
                                 const int* __restrict__ j_s,         // [n_rays]
                                 int n_nu, 
                                 int n_rays,
-                                int n_fpos,
+                                int n_stars,
                                 double *tau,           // [n_fpos, n_ipos, n_nu]
                                 const unsigned char* is_target_cell,
                                 double* tau_cell)
@@ -1023,7 +1023,7 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
                                 val = y0 + ((y1 - y0) / (x1 - x0)) * (red_gnu-x0);
                             }
                         }
-                        int index = i_s[ray_idx] * n_fpos * n_nu + j_s[ray_idx] * n_nu + nu_idx;
+                        int index = i_s[ray_idx] * n_stars * n_nu + j_s[ray_idx] * n_nu + nu_idx;
                         double dtau = drt[ray_idx] * val;
                         atomicAdd(&tau[index], dtau);
                         if (is_target_cell[ray_idx]) atomicAdd(&tau_cell[index], dtau);
@@ -1058,7 +1058,7 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
             gdr[target_mask] =  dr_cell[gray_ind[target_mask,0],gray_ind[target_mask,2]]
             gden = cp.asarray(den, dtype=cp.float64)
             n_nu = len(gnu)
-            n_fpos = gtau_i_j.shape[1]
+            n_fpos = len(fpos)
             threads_per_block = 256
             ind_all = cp.arange(gopacity.shape[0], dtype=cp.int32)
             ray_ind_arange = cp.arange(len(ray_ind))
@@ -1085,48 +1085,37 @@ def gpu_ray_trace_4(ray_ind, ray_cell_local, dr, ipos, fpos, nu, den, mu, opacit
                 batch_interp_kernel(
                     grid, block,
                     (gnu, red, chix_i, chi_ind32, drt, i_s32, j_s32,
-                    n_nu, n_rays, n_fpos, gtau_i_j, is_target_cell_i,tau_cell))
+                    np.int32(n_nu), np.int32(n_rays), np.int32(n_stars), gtau_i_j, is_target_cell_i,tau_cell))
                 bool_in_sum += bool_in
             gtau_i_j -= tau_cell
             cp.exp(-gtau_i_j, out=gtau_i_j)
             ell = dr_cell[:,:,None]
             r0 = r0[:,:,None]
-            
-            # 1. Identify zero-length segments to mask out later
-            mask_zero_ell = (ell == 0.0)
-            
-            # 2. Create "safe" variables to prevent CuPy from eager-evaluating divisions by zero
-            ell_safe = cp.where(mask_zero_ell, 1.0, ell)
-            r0_safe = cp.where(r0 == 0.0, 1e-10, r0) # Prevents 1/0 if source is dead center
-            tau_safe = cp.where(tau_cell == 0.0, 1.0, tau_cell) # Prevents 1/0 in asymp branch
-            
-            x0 = tau_cell * r0_safe / ell_safe
-            x1 = tau_cell * (r0_safe + ell_safe) / ell_safe
-            
-            # 3. Define the safe regime
-            safe_mask = x0 < 100.0 
-            
-            # 4. Sanitize inputs for the exact calculation so CuPy never computes inf * 0
-            x0_safe = cp.where(safe_mask, x0, 1.0)
-            x1_safe = cp.where(safe_mask, x1, 1.0)
-            
-            # Compute Exact Solution ONLY on sanitized arrays
-            exact_num = 1/r0_safe - cp.exp(-tau_cell)/(r0_safe+ell_safe) + \
-                        (tau_cell/ell_safe) * cp.exp(x0_safe) * (exp1(x1_safe) - exp1(x0_safe))
-            exact_solution = exact_num / (4*cp.pi*ell_safe)
-            
-            # Compute fully simplified Asymptotic Solution (1/r0 physically cancels out)
-            asymp_solution = 1 / (4 * cp.pi * tau_safe * r0_safe**2)
-            
-            # 5. Recombine based on the safe mask
-            tau_cell_new = cp.where(safe_mask, exact_solution, asymp_solution)
-            
-            # 6. Apply physical logic: zero-length segments contribute zero attenuation
-            tau_cell[:] = cp.where(mask_zero_ell, 0.0, tau_cell_new)
-             
 
-            # tau_cell[:] = (1/r0-cp.exp(-tau_cell)/(r0+ell)+(tau_cell/ell)*cp.exp(tau_cell*r0/ell)*\
-            #     (exp1(tau_cell*(r0+ell)/ell)-exp1(tau_cell*r0/ell)))/(4*cp.pi*ell)
+            safe_ell = cp.where(ell == 0, 1.0, ell)
+
+            arg1 = tau_cell * (r0 + safe_ell) / safe_ell
+            arg2 = tau_cell * r0 / safe_ell
+
+            # Prevent exp1(0) which yields infinity and downstream NaNs
+            arg1 = cp.where(arg1 == 0, 1e-10, arg1)
+            arg2 = cp.where(arg2 == 0, 1e-10, arg2)
+
+            safe_arg2_exp = cp.where(arg2 > 700.0, 700.0, arg2)
+            safe_arg1_exp = cp.where(arg1 > 700.0, 700.0, arg1)
+            bracket_unsafe = cp.exp(safe_arg2_exp) * (exp1(safe_arg1_exp) - exp1(safe_arg2_exp))
+            bracket_safe = cp.exp(-tau_cell) / arg1 - 1.0 / arg2
+            bracket = cp.where(arg2 > 700.0, bracket_safe, bracket_unsafe)
+            val = (1/r0 - cp.exp(-tau_cell)/(r0+safe_ell) + (tau_cell/safe_ell) * bracket) / (4*cp.pi*safe_ell)
+            
+            # val = (1/r0 - cp.exp(-tau_cell)/(r0+safe_ell) + (tau_cell/safe_ell) * cp.exp(tau_cell*r0/safe_ell) * \
+            #     (exp1(arg1) - exp1(arg2))) / (4*cp.pi*safe_ell)
+
+            # Only assign the valid ray segment intensities
+            tau_cell[:] = cp.where(ell > 0, val, 0.0)
+
+            #tau_cell[:] = (1/r0-cp.exp(-tau_cell)/(r0+ell)+(tau_cell/ell)*cp.exp(tau_cell*r0/ell)*\
+            #    (exp1(tau_cell*(r0+ell)/ell)-exp1(tau_cell*r0/ell)))/(4*cp.pi*ell)
             
             gtau_i_j *= tau_cell
             gspectra = cp.asarray(spectra_times, dtype=cp.float64)
@@ -1178,26 +1167,17 @@ def gpu_ray_trace_1(ll, ur, dx, initial_pos, final_pos,gpu=0):
                 'T tmax, T tmin',
                 'bool bool_tmin',
                 '''
-                bool_tmin = (tmin < tmax) & (tmin < 1) & (tmax > 0);
+                bool_tmin = (tmin < tmax) & (tmin < 1.0) & (tmax > 0.0);
                 ''',
                 'bool_tmin_kernel'
             )
         if use_hull:
-            # bool_stars = (np.sum(initial_pos > self.star_center -0.3*self.halo_r,axis=1)==3) *\
-            #             (np.sum(initial_pos < self.star_center +0.3*self.halo_r,axis=1)==3)
-            #all_points = np.vstack((initial_pos[bool_stars],final_pos))
             all_points = np.vstack((initial_pos.reshape(-1, 3),final_pos))
             hull = ConvexHull(all_points)
             bool_bound = (contained(ll, hull, bigeps=dx[:, np.newaxis]) | contained(ur, hull, bigeps=dx[:, np.newaxis]) \
             | contained( (ur + ll) / 2,hull, bigeps=dx[:, np.newaxis]))
-            # for istar in np.arange(len(initial_pos))[np.logical_not(bool_stars)]:
-            #     all_points = np.vstack((initial_pos[istar],final_pos))
-            #     hull = ConvexHull(all_points)
-            #     bool_bound += contained(ll,hull,bigeps=dx[:,np.newaxis])+contained(ur,hull,bigeps=dx[:,np.newaxis])\
-            #         +contained((ur+ll)/2,hull,bigeps=dx[:,np.newaxis])
             tot = max(initial_pos.shape[1]*len(final_pos)*bool_bound.sum()/4e8, 1)
             ll_max = int(max(bool_bound.sum()// (500/tot), 1))
-            #print(bool_bound.sum()/len(ll),tot,ll_max)
         else:
             ll_max = max(ll.shape[0]//200, 1)
             bool_bound = np.arange(ll.shape[0])
@@ -1216,8 +1196,10 @@ def gpu_ray_trace_1(ll, ur, dx, initial_pos, final_pos,gpu=0):
             tmin_list = []
             tmax_list = []
             for split_ll_i in split_ll_g:
-                t0 = (ll_g[split_ll_i][None,:,None,:] - ipos_g[:,None,:,:]) / M[:,None,:,:]
-                t1 = (ur_g[split_ll_i][None,:,None,:] - ipos_g[:,None,:,:]) / M[:,None,:,:]
+                delta_ll = (ll_g[split_ll_i][None,:,None,:] - ipos_g[:,None,:,:])
+                t0 = delta_ll / M[:,None,:,:]
+                delta_ur = (ur_g[split_ll_i][None,:,None,:] - ipos_g[:,None,:,:])
+                t1 = delta_ur / M[:,None,:,:]
                 tmin = cp.minimum(t0, t1)
                 tmax = cp.maximum(t0, t1)
                 del t0, t1
@@ -1238,13 +1220,15 @@ def gpu_ray_trace_1(ll, ur, dx, initial_pos, final_pos,gpu=0):
             ray_ind = cp.vstack(ray_ind_list)
             tmin_f = cp.concatenate(tmin_list)
             tmax_f = cp.concatenate(tmax_list)
-            tmin_f_clamped = cp.maximum(tmin_f, 0)
+            tmin_f_clamped = cp.maximum(tmin_f, 0.0)
             ray_fraction = 0.5 * (tmin_f_clamped + tmax_f)
             del tmin_f
             ray_ind_col2 = ray_ind[:,2]
             ray_ind_col0 = ray_ind[:,0]
             ipos_ray = ipos_g[ray_ind_col0, ray_ind_col2]
             p_close = tmin_f_clamped[:,None]*M[ray_ind_col0,ray_ind_col2] + ipos_ray
-            p_far = tmax_f[:,None]*M[ray_ind_col0,ray_ind_col2] + ipos_ray
+            p_far = tmax_f[:,None]*M[ray_ind_col0,ray_ind_col2]+ ipos_ray
             dr = cp.linalg.norm(p_far-p_close, axis=1)
+
+            
             return dr.get(), ray_ind.get(),ray_fraction.get()

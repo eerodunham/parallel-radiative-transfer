@@ -5,6 +5,10 @@ import cupy as cp
 import yt
 
 from spectra_solver_mk2 import gpu_ray_trace_1, gpu_ray_trace_4
+from spectra_solver_mk2 import Radiative_Transfer as RT
+
+def test_raytrace_full():
+    pass
 
 def test_raytrace_mock(dataset_path, halo_tree_path, stars_path, halo_id, timestep, n_ipos, n_fpos, n_nu, n_time_bins):
     '''
@@ -35,7 +39,8 @@ def test_raytrace_mock(dataset_path, halo_tree_path, stars_path, halo_id, timest
     ll = np.column_stack([x - dx_cgs/2.0, y - dx_cgs/2.0, z - dx_cgs/2.0])
     ur = np.column_stack([x + dx_cgs/2.0, y + dx_cgs/2.0, z + dx_cgs/2.0])
     fpos = np.column_stack([x, y, z])
-    den = reg[("gas", "density")].in_units("g/cm**3").v[:n_fpos]
+    all_den = reg[("gas", "density")].in_units("g/cm**3").v
+    den = all_den[:n_fpos]
     ipos = (stars[id][timestep]['positions2'] * ds.length_unit.in_units("cm").v)[:n_ipos]
     #mock star position tensor (light travel time ignored)
     ipos_3d = np.repeat(ipos[np.newaxis, :, :], n_fpos, axis=0)
@@ -69,6 +74,7 @@ def test_raytrace_mock(dataset_path, halo_tree_path, stars_path, halo_id, timest
     start_rt1.record()
     dr, ray_ind, ray_fraction = gpu_ray_trace_1(ll, ur, dx_cgs, ipos_3d, fpos)
     end_rt1.record()
+    print(f"rt1 finished!")
     n_rays = len(dr)
     #mock redshift (default to 0)
     redshift = np.zeros(n_rays, dtype=np.float64)
@@ -94,7 +100,6 @@ def test_raytrace_mock(dataset_path, halo_tree_path, stars_path, halo_id, timest
 
     unattenuated_total_spectrum = np.sum(spectra_times[-1, :, :], axis=0)
     attenuated_total_spectrum = np.sum(final_intensity, axis=0)
-    print(attenuated_total_spectrum)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.loglog(nu, unattenuated_total_spectrum, label="Initial Total Source Spectrum (Before)", color="crimson", lw=2)
@@ -116,9 +121,9 @@ if __name__ == "__main__":
     star_list = "../data/starlists_2020.npy"
     halo_id = 0
     timestep = 0
-    n_ipos = 2
-    n_fpos = 2
-    n_nu = 10
+    n_ipos = 500
+    n_fpos = 50
+    n_nu = 2000
     n_time_bins = 5
     test_raytrace_mock(dataset_path, halo_tree, star_list, halo_id, timestep, n_ipos, n_fpos, n_nu, n_time_bins)
     print("TEST COMPLETE")
